@@ -43,10 +43,9 @@ until an editor approves it, shows only approved text, withdraws it when the
 post changes materially and generates a fresh candidate for review, and
 caps calls per day with a kill switch.
 
-Measured result: none yet. This is a new feature, written from the
-description. The builder defines how the README's measured-result line will
-be measured (see section 13, question 9); the line is filled after the first
-month in use.
+The README states in plain words what the plugin does: it writes a
+draft summary for long posts, holds it for editor approval, and withdraws it
+when the post changes. It carries no measured-result line.
 
 ## 2. Goals and non-goals
 
@@ -881,9 +880,9 @@ The builder answers each in `docs/ARCHITECTURE.md`.
 7. Should backfill also be offered in the admin, or stay WP-CLI only?
 8. Block editor scripts with no build step (this PRD) or `@wordpress/scripts`
    with a committed build?
-9. The README's measured-result line: proposed measures are the share of
-   eligible posts with an approved summary after 30 days and the share
-   approved without edits. The builder fixes the method.
+9. The README describes what the plugin does and carries no
+   measured-result line, because none can be measured from the plugin
+   alone. Confirm the plain statement the builder writes.
 10. Global default mode on a fresh install: `on` (this PRD, safe because
     nothing shows without approval) or `off` so the operator opts in by
     category?
