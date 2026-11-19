@@ -24,6 +24,14 @@ final class PostState
 
     public const STATUSES = ['none', 'queued', 'generating', 'pending', 'approved', 'rejected', 'failed', 'deferred', 'withdrawn', 'short'];
 
+    /** Drop the cached meta of a post so the next read is fresh. */
+    public static function refresh(int $postId): void
+    {
+        if (function_exists('wp_cache_delete')) {
+            wp_cache_delete($postId, 'post_meta');
+        }
+    }
+
     public static function status(int $postId): string
     {
         $s = get_post_meta($postId, self::STATUS, true);

@@ -47,7 +47,7 @@ final class Counters
      */
     public static function reserve(): string
     {
-        if (!self::lock()) {
+        if (!self::acquire()) {
             return 'lock';
         }
         try {
@@ -72,14 +72,14 @@ final class Counters
 
             return '';
         } finally {
-            self::unlock();
+            self::release();
         }
     }
 
     /** Give a unit back. Only used when no call was made at all. */
     public static function refund(): void
     {
-        if (!self::lock()) {
+        if (!self::acquire()) {
             return;
         }
         try {
@@ -87,7 +87,7 @@ final class Counters
             $c['count'] = max(0, $c['count'] - 1);
             self::write($c);
         } finally {
-            self::unlock();
+            self::release();
         }
     }
 
@@ -97,7 +97,7 @@ final class Counters
         if ($cost === null) {
             return;
         }
-        if (!self::lock()) {
+        if (!self::acquire()) {
             Logger::log('warning', 'cost not recorded: lock busy', [], 'lock');
             return;
         }
@@ -111,7 +111,7 @@ final class Counters
             }
             self::write($c);
         } finally {
-            self::unlock();
+            self::release();
         }
     }
 
@@ -163,6 +163,7 @@ final class Counters
     {
         if (function_exists('wp_cache_delete')) {
             wp_cache_delete(self::OPTION, 'options');
+            wp_cache_delete('notoptions', 'options');
         }
         $v = get_option(self::OPTION, []);
 
@@ -170,30 +171,79 @@ final class Counters
     }
 
     /**
-     * Take the lock: an insert that fails when the row exists. An expired
-     * lock is taken over once.
+     * Take the lock row. With a real database this is one `INSERT IGNORE`
+     * on the options table's unique key, so exactly one process wins; an
+     * expired lock is taken over by one conditional `UPDATE`. add_option()
+     * is not used: it checks and then upserts, so two processes could both
+     * believe they hold the lock.
      */
-    private static function lock(): bool
+    public static function acquire(): bool
     {
-        $until = Clock::now() + self::LOCK_TTL;
+        $now = Clock::now();
+        $until = $now + self::LOCK_TTL;
+        global $wpdb;
+        if ($wpdb instanceof \wpdb) {
+            $inserted = self::exec($wpdb, $wpdb->prepare(
+                "INSERT IGNORE INTO %i (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+                $wpdb->options,
+                self::LOCK,
+                (string) $until
+            ));
+            if ($inserted === 1) {
+                self::forget(self::LOCK);
+                return true;
+            }
+            $taken = self::exec($wpdb, $wpdb->prepare(
+                'UPDATE %i SET option_value = %s WHERE option_name = %s AND CAST(option_value AS UNSIGNED) < %d',
+                $wpdb->options,
+                (string) $until,
+                self::LOCK,
+                $now
+            ));
+            self::forget(self::LOCK);
+
+            return $taken === 1;
+        }
+        // No database layer (unit tests without wpdb): best effort.
         if (add_option(self::LOCK, $until, '', false)) {
             return true;
         }
-        if (function_exists('wp_cache_delete')) {
-            wp_cache_delete(self::LOCK, 'options');
-        }
         $held = get_option(self::LOCK, 0);
-        if (is_numeric($held) && (int) $held < Clock::now()) {
-            delete_option(self::LOCK);
-
-            return add_option(self::LOCK, $until, '', false);
+        if (is_numeric($held) && (int) $held < $now) {
+            update_option(self::LOCK, $until, false);
+            return true;
         }
 
         return false;
     }
 
-    private static function unlock(): void
+    public static function release(): void
     {
+        global $wpdb;
+        if ($wpdb instanceof \wpdb) {
+            self::exec($wpdb, $wpdb->prepare('DELETE FROM %i WHERE option_name = %s', $wpdb->options, self::LOCK));
+            self::forget(self::LOCK);
+            return;
+        }
         delete_option(self::LOCK);
+    }
+
+    /** Rows affected, or -1 when the statement could not be built or run. */
+    private static function exec(\wpdb $wpdb, ?string $sql): int
+    {
+        if ($sql === null || $sql === '') {
+            return -1;
+        }
+        $r = $wpdb->query($sql);
+
+        return is_int($r) ? $r : -1;
+    }
+
+    private static function forget(string $option): void
+    {
+        if (function_exists('wp_cache_delete')) {
+            wp_cache_delete($option, 'options');
+            wp_cache_delete('notoptions', 'options');
+        }
     }
 }

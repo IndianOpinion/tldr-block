@@ -159,6 +159,11 @@ final class AdminTest extends TestCase
         self::assertStringContainsString('name="tldr_block_api_key" value=""', $html);
         self::assertStringContainsString('counts against the daily cap', $html);
 
+        Settings::update(['generation' => 'off']);
+        self::assertFalse(SettingsPage::testConnection()['ok'], 'the kill switch also stops the test call');
+        self::assertSame(0, $this->caller->count());
+        Settings::update(['generation' => 'on']);
+
         $r = SettingsPage::testConnection();
         self::assertTrue($r['ok']);
         self::assertStringContainsString('counted against the daily cap', $r['message']);

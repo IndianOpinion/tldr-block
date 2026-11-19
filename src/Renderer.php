@@ -170,9 +170,12 @@ final class Renderer
      *
      * @param array<string, mixed> $attributes
      */
-    public static function renderBlock(array $attributes): string
+    public static function renderBlock(array $attributes, mixed $content = '', mixed $block = null): string
     {
-        $postId = (int) get_the_ID();
+        // In a Query Loop the block context names the post; fall back to
+        // the global post elsewhere.
+        $ctxId = is_object($block) && isset($block->context) && is_array($block->context) ? ($block->context['postId'] ?? null) : null;
+        $postId = is_numeric($ctxId) && (int) $ctxId > 0 ? (int) $ctxId : (int) get_the_ID();
         $args = ['context' => 'block', 'show_heading' => ($attributes['showHeading'] ?? true) !== false];
         if (isset($attributes['heading']) && is_string($attributes['heading']) && $attributes['heading'] !== '') {
             $args['heading'] = sanitize_text_field($attributes['heading']);

@@ -49,6 +49,15 @@ final class Review
             $origin = 'edited';
         }
         $live = self::liveFrom($candidate, $origin, $userId);
+        // The post may have changed materially since the candidate was
+        // generated (a newer job is then queued). The approved text then
+        // describes an older version and starts out stale (case 19).
+        $from = PostState::fingerprintOf($candidate);
+        $now = self::currentFingerprint($postId);
+        if ($from !== null && $now !== null && $now->isMaterialChangeFrom($from, Settings::threshold())) {
+            $live['stale'] = true;
+            Logger::log('info', 'approved text is already stale', ['post_id' => $postId]);
+        }
         self::goLive($postId, $live);
         PostState::setCandidate($postId, null);
         PostState::setStatus($postId, 'approved');

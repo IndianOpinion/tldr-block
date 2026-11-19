@@ -96,6 +96,20 @@ final class ReviewTest extends TestCase
         self::assertNotSame('', $this->render($id));
     }
 
+    /** Case 19: approving a candidate the post has since moved away from leaves it stale. */
+    public function testApprovingAnOutdatedCandidateStartsStale(): void
+    {
+        $id = $this->post(800);
+        $this->saveAndRun($id);
+        $c = PostState::candidate($id);
+        WpStub::updatePost($id, ['post_content' => self::html(self::text(800, 55))]);
+        $this->save($id);
+        $this->editor();
+        self::assertSame(200, $this->code($this->dispatch('POST', $id, 'approve', ['candidate_id' => $c['id']])));
+        self::assertTrue(PostState::live($id)['stale']);
+        self::assertSame('', $this->render($id), 'hidden by the default stale display');
+    }
+
     /** T47 (case 47). */
     public function testEditAndApprove(): void
     {
@@ -310,6 +324,13 @@ final class ReviewTest extends TestCase
         self::assertSame([[$id, 'post_switch']], WpStub::fired('tldr_block_display_changed'));
         self::assertSame('', $this->render($id));
         $this->dispatch('POST', $id, 'override', ['mode' => 'auto']);
+        self::assertSame('auto', PostState::override($id));
+
+        // Authors and anonymous users cannot switch a post.
+        WpStub::user(5, ['edit_posts', 'edit_published_posts', 'read']);
+        self::assertSame(403, $this->code($this->dispatch('POST', $id, 'override', ['mode' => 'off'])));
+        WpStub::user(0, []);
+        self::assertSame(401, $this->code($this->dispatch('POST', $id, 'override', ['mode' => 'off'])));
         self::assertSame('auto', PostState::override($id));
     }
 

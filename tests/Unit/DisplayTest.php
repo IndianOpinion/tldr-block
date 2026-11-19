@@ -132,6 +132,13 @@ final class DisplayTest extends TestCase
         WpStub::$flags['the_id'] = $pending;
         $out = Renderer::renderBlock([]);
         self::assertSame('', $out);
+        // In a Query Loop the block context names the post, not the global.
+        Renderer::reset();
+        $block = (object) ['context' => ['postId' => $this->id]];
+        self::assertStringContainsString('tldr-block__points', Renderer::renderBlock([], '', $block));
+        Renderer::reset();
+        self::assertSame('', Renderer::renderBlock([], '', (object) ['context' => ['postId' => $pending]]));
+        self::assertFileExists(dirname(__DIR__, 2) . '/blocks/summary/editor.asset.php', 'no build step: hand-written asset file');
         $editorJs = (string) file_get_contents(dirname(__DIR__, 2) . '/blocks/summary/editor.js');
         self::assertStringContainsString('Summary pending review', $editorJs);
         // The block in the content stops automatic insertion.

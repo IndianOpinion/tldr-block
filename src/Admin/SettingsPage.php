@@ -234,6 +234,9 @@ final class SettingsPage
      */
     public static function testConnection(): array
     {
+        if (Settings::killSwitchOn()) {
+            return ['ok' => false, 'message' => __('Test connection refused: generation is paused by the kill switch.', 'tldr-block')];
+        }
         $caller = ClientFactory::caller();
         if ($caller === null) {
             return ['ok' => false, 'message' => __('Test connection: no provider is configured.', 'tldr-block')];

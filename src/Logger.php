@@ -31,6 +31,12 @@ final class Logger
         if ($level === 'debug' && !Settings::get()['debug']) {
             return;
         }
+        $message = self::redact($message);
+        foreach ($context as $k => $v) {
+            if (is_string($v)) {
+                $context[$k] = self::redact($v);
+            }
+        }
         do_action('tldr_block_log', $level, $message, $context);
 
         if ($level === 'error' || $level === 'warning') {
@@ -56,6 +62,21 @@ final class Logger
             return;
         }
         error_log($line);
+    }
+
+    /**
+     * Remove secrets from text bound for a log, the error list or post
+     * meta: the configured API key, bearer tokens and key-shaped strings.
+     */
+    public static function redact(string $text): string
+    {
+        $key = Settings::apiKey();
+        if (strlen($key) >= 8) {
+            $text = str_replace($key, '[redacted]', $text);
+        }
+        $text = (string) preg_replace('/\b(Bearer|Basic)\s+[A-Za-z0-9._~+\/=-]{8,}/i', '$1 [redacted]', $text);
+
+        return (string) preg_replace('/\b(?:sk|pk|rk|key)-[A-Za-z0-9_-]{12,}/', '[redacted]', $text);
     }
 
     /**
