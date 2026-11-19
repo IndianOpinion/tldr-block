@@ -197,7 +197,11 @@ class wpdb
     public function prepare(string $query, mixed ...$args): string
     {
         foreach ($args as $a) {
-            $query = (string) preg_replace_callback('/%[si]/', static fn (array $m): string => $m[0] === '%i' ? '`' . $a . '`' : "'" . addslashes((string) $a) . "'", $query, 1);
+            $query = (string) preg_replace_callback('/%[sid]/', static fn (array $m): string => match ($m[0]) {
+                '%i' => '`' . $a . '`',
+                '%d' => (string) (int) $a,
+                default => "'" . addslashes((string) $a) . "'",
+            }, $query, 1);
         }
 
         return $query;
@@ -206,6 +210,28 @@ class wpdb
     public function query(string $sql): int
     {
         $this->queries[] = $sql;
+        $opts = &\IndianOpinion\TldrBlock\Tests\Stubs\WpStub::$options[\IndianOpinion\TldrBlock\Tests\Stubs\WpStub::$blog];
+        $opts ??= [];
+        // Emulate the lock statements against the stub option store.
+        if (preg_match("/^INSERT IGNORE INTO `[^`]+` \\(option_name, option_value, autoload\\) VALUES \\('([^']*)', '([^']*)', 'no'\\)$/", $sql, $m) === 1) {
+            if (array_key_exists($m[1], $opts)) {
+                return 0;
+            }
+            $opts[$m[1]] = $m[2];
+            return 1;
+        }
+        if (preg_match("/^UPDATE `[^`]+` SET option_value = '([^']*)' WHERE option_name = '([^']*)' AND CAST\\(option_value AS UNSIGNED\\) < (\\d+)$/", $sql, $m) === 1) {
+            if (array_key_exists($m[2], $opts) && (int) $opts[$m[2]] < (int) $m[3]) {
+                $opts[$m[2]] = $m[1];
+                return 1;
+            }
+            return 0;
+        }
+        if (preg_match("/^DELETE FROM `[^`]+` WHERE option_name = '([^']*)'$/", $sql, $m) === 1) {
+            $had = array_key_exists($m[1], $opts);
+            unset($opts[$m[1]]);
+            return $had ? 1 : 0;
+        }
         // Mirror the transient delete against the stub store.
         if (preg_match_all("/LIKE '([^']*)'/", $sql, $m) > 0) {
             foreach ($m[1] as $like) {

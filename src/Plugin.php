@@ -101,8 +101,8 @@ final class Plugin
 
     public static function integrations(): void
     {
-        add_filter(GenQueue::HANDLERS_FILTER, [GenQueue::class, 'registerHandler']);
-        add_filter(PromptLibrary::DEFAULTS_FILTER, [PromptLibrary::class, 'registerDefault']);
+        add_action(GenQueue::REGISTER_ACTION, [GenQueue::class, 'registerType']);
+        add_action('init', [PromptLibrary::class, 'register'], 20);
     }
 
     public static function onSave(int $postId, mixed $post = null): void

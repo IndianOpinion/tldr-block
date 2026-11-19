@@ -28,6 +28,17 @@ final class Generator
 
     private static int $tickJobs = 0;
     private static ?int $tickStart = null;
+    private static ?float $lastCost = null;
+
+    /**
+     * Cost the provider reported for the last call this request made, or
+     * null when no call was made or no cost was reported. Read by the
+     * gen-queue handler to report spend to the queue's own cap.
+     */
+    public static function lastCost(): ?float
+    {
+        return self::$lastCost;
+    }
 
     /** Reset the per-request tick budget (tests, CLI). */
     public static function resetTick(): void
@@ -57,6 +68,7 @@ final class Generator
      */
     public static function run(int $postId): string
     {
+        self::$lastCost = null;
         $post = get_post($postId);
         $job = PostState::job($postId);
         if (!$post instanceof \WP_Post) {
@@ -78,12 +90,24 @@ final class Generator
             Logger::log('info', 'held after credit exhaustion', ['post_id' => $postId], 'credit_hold_wait');
             return 'deferred';
         }
-        $now = Clock::now();
-        if ((int) ($job['lease_until'] ?? 0) > $now) {
+        $caller = ClientFactory::caller();
+        if ($caller === null) {
+            // Nothing is reserved or spent: no call can be made.
+            return self::fail($postId, 'no_provider', 'no caller could be built', false);
+        }
+        // Take the lease under the counter lock, so two runners can never
+        // both pass the lease and per-post checks for one post.
+        $claim = self::claimLease($postId);
+        if ($claim === 'lock') {
+            Logger::log('error', 'counter lock busy, job skipped', ['post_id' => $postId], 'lock');
+            Queue::schedule($postId, Clock::now() + 60, 'retry');
+            return 'busy';
+        }
+        if ($claim === 'busy') {
             Logger::log('info', 'skipped: lease held by another runner', ['post_id' => $postId]);
             return 'busy';
         }
-        PostState::patchJob($postId, ['lease_until' => $now + self::LEASE_SECONDS]);
+        $job = PostState::job($postId);
         PostState::setStatus($postId, 'generating');
 
         $settings = Settings::get();
@@ -92,28 +116,7 @@ final class Generator
         if ($dayCount >= $settings['post_limit']) {
             return self::defer($postId, 'post_limit');
         }
-        $refusal = Counters::reserve();
-        if ($refusal === 'lock') {
-            PostState::patchJob($postId, ['lease_until' => 0]);
-            Logger::log('error', 'counter lock busy, job skipped', ['post_id' => $postId], 'lock');
-            Queue::schedule($postId, Clock::now() + 60, 'retry');
-            return 'busy';
-        }
-        if ($refusal !== '') {
-            return self::defer($postId, $refusal);
-        }
-        $desc = ClientFactory::describe();
-        $meter = SpendMeter::preSpend($desc['provider'], $desc['model']);
-        if ($meter !== null && !$meter['allowed']) {
-            Counters::refund();
-            if ($meter['reservation_id'] !== null) {
-                SpendMeter::release($meter['reservation_id']);
-            }
-            return self::defer($postId, $meter['reason']);
-        }
-        PostState::patchJob($postId, ['day' => $day, 'day_count' => $dayCount + 1]);
 
-        $caller = ClientFactory::caller();
         $full = Eligibility::sourceText($post);
         $startFp = Fingerprint::of($full);
         [$body, $truncated] = SourceText::truncate($full, $settings['input_limit']);
@@ -131,7 +134,7 @@ final class Generator
         ];
         $prompt = Prompt::build($vars);
         $request = new CallRequest(
-            'tldr-block.summary',
+            SpendMeter::PURPOSE,
             $prompt['system'],
             $prompt['user'],
             Prompt::schema($format),
@@ -142,34 +145,65 @@ final class Generator
             Language::scriptFor($lang['code'])
         );
 
+        $refusal = Counters::reserve();
+        if ($refusal === 'lock') {
+            PostState::patchJob($postId, ['lease_until' => 0]);
+            Logger::log('error', 'counter lock busy, job skipped', ['post_id' => $postId], 'lock');
+            Queue::schedule($postId, Clock::now() + 60, 'retry');
+            return 'busy';
+        }
+        if ($refusal !== '') {
+            return self::defer($postId, $refusal);
+        }
+        $desc = ClientFactory::describe();
+        $estTokens = (int) ceil((strlen($prompt['system']) + strlen($prompt['user'])) / 4);
+        $meter = SpendMeter::preSpend($desc['provider'], $desc['model'], $estTokens, $request->maxTokens);
+        if ($meter !== null && !$meter['allowed']) {
+            Counters::refund();
+            if ($meter['reservation_id'] !== null) {
+                SpendMeter::release($meter['reservation_id']);
+            }
+            return self::defer($postId, $meter['reason']);
+        }
+        PostState::patchJob($postId, ['day' => $day, 'day_count' => $dayCount + 1]);
+
         $started = microtime(true);
         try {
-            if ($caller === null) {
-                throw new CallFailed('no_provider', 'no caller could be built');
-            }
             $result = $caller->call($request);
         } catch (CallFailed $e) {
             Counters::addCost($e->cost);
+            self::$lastCost = $e->cost;
             if ($meter !== null) {
-                SpendMeter::record($meter['reservation_id'], ['status' => 'error', 'provider' => $desc['provider'], 'model' => $desc['model'], 'tokens_in' => null, 'tokens_out' => null, 'cost' => $e->cost]);
+                $billed = $e->cost !== null && $e->cost > 0;
+                $call = [
+                    'status' => $e->creditExhausted || !$billed ? 'error_unbilled' : 'error_billed',
+                    'provider' => $desc['provider'],
+                    'model' => $desc['model'],
+                    'cost' => $e->cost,
+                    'latency_ms' => (int) ((microtime(true) - $started) * 1000),
+                    'error_code' => $e->errorClass,
+                ];
+                if ($e->creditExhausted) {
+                    $call['http_status'] = 402;
+                }
+                SpendMeter::record($meter['reservation_id'], $call);
             }
             return self::fail($postId, $e->errorClass, $e->getMessage(), $e->creditExhausted);
         } catch (\Throwable $e) {
             if ($meter !== null) {
-                SpendMeter::record($meter['reservation_id'], ['status' => 'error', 'provider' => $desc['provider'], 'model' => $desc['model'], 'tokens_in' => null, 'tokens_out' => null, 'cost' => null]);
+                SpendMeter::record($meter['reservation_id'], [
+                    'status' => 'error_unbilled', 'provider' => $desc['provider'], 'model' => $desc['model'],
+                    'latency_ms' => (int) ((microtime(true) - $started) * 1000), 'error_code' => 'exception',
+                ]);
             }
             return self::fail($postId, 'exception', $e->getMessage(), false);
         }
         Counters::addCost($result->cost);
-        if ($meter !== null) {
-            SpendMeter::record($meter['reservation_id'], [
-                'status' => 'ok', 'provider' => $result->provider, 'model' => $result->model,
-                'tokens_in' => $result->promptTokens, 'tokens_out' => $result->completionTokens, 'cost' => $result->cost,
-            ]);
-        }
+        self::$lastCost = $result->cost;
+        $latency = $result->durationMs ?: (int) ((microtime(true) - $started) * 1000);
         Logger::log('debug', 'call finished', [
             'post_id' => $postId, 'model' => $result->model, 'tokens_in' => $result->promptTokens,
-            'tokens_out' => $result->completionTokens, 'ms' => $result->durationMs ?: (int) ((microtime(true) - $started) * 1000),
+            'tokens_out' => $result->completionTokens, 'ms' => $latency,
         ]);
 
         $check = Validator::check($result->data, [
@@ -183,6 +217,19 @@ final class Generator
         ]);
         $extra = apply_filters('tldr_block_validate', [], $result->data, ['post_id' => $postId, 'format' => $format, 'language' => $lang['code']]);
         $errors = array_merge($check['errors'], is_array($extra) ? array_values(array_filter($extra, 'is_string')) : []);
+        if ($meter !== null) {
+            // A billed answer that fails validation is still spend, recorded
+            // as error_billed, as the meter's contract asks.
+            $call = [
+                'status' => $errors === [] ? 'ok' : 'error_billed', 'provider' => $result->provider, 'model' => $result->model,
+                'input_tokens' => $result->promptTokens, 'output_tokens' => $result->completionTokens, 'cost' => $result->cost,
+                'latency_ms' => $latency,
+            ];
+            if ($errors !== []) {
+                $call['error_code'] = 'validation';
+            }
+            SpendMeter::record($meter['reservation_id'], $call);
+        }
         if ($errors !== []) {
             return self::fail($postId, 'validation', implode(',', $errors), false);
         }
@@ -194,7 +241,8 @@ final class Generator
             if ($nowFp->isMaterialChangeFrom($startFp, Settings::threshold())) {
                 PostState::patchJob($postId, ['lease_until' => 0]);
                 Logger::log('info', 'result discarded: post changed during the call', ['post_id' => $postId]);
-                if (wp_next_scheduled(Queue::EVENT, [$postId]) === false) {
+                $pending = wp_next_scheduled(Queue::EVENT, [$postId]) !== false || !empty(PostState::job($postId)['gq_id']);
+                if (!$pending) {
                     PostState::setBasis($postId, $nowFp);
                     Queue::schedule($postId, Clock::now() + Settings::debounce(), 'save');
                 } else {
@@ -258,6 +306,30 @@ final class Generator
         return ['name' => $name, 'code' => $code];
     }
 
+    /**
+     * Take the per-post lease atomically. Returns '' when taken, 'busy'
+     * when another runner holds a live lease, 'lock' when the counter lock
+     * could not be had. An expired lease is taken over.
+     */
+    private static function claimLease(int $postId): string
+    {
+        if (!Counters::acquire()) {
+            return 'lock';
+        }
+        try {
+            PostState::refresh($postId);
+            $now = Clock::now();
+            if ((int) (PostState::job($postId)['lease_until'] ?? 0) > $now) {
+                return 'busy';
+            }
+            PostState::patchJob($postId, ['lease_until' => $now + self::LEASE_SECONDS]);
+
+            return '';
+        } finally {
+            Counters::release();
+        }
+    }
+
     private static function defer(int $postId, string $reason): string
     {
         wp_clear_scheduled_hook(Queue::EVENT, [$postId]);
@@ -274,7 +346,7 @@ final class Generator
     {
         $job = PostState::job($postId);
         $attempt = (int) ($job['attempts'] ?? 0) + 1;
-        $message = mb_substr($message, 0, 300, 'UTF-8');
+        $message = mb_substr(Logger::redact($message), 0, 300, 'UTF-8');
         PostState::patchJob($postId, [
             'attempts' => $attempt,
             'lease_until' => 0,

@@ -249,24 +249,57 @@ final class QueueTest extends TestCase
         self::assertSame([$id], $events[0]['args']);
 
         $got = [];
-        add_filter(GenQueue::ENQUEUE_FILTER, function ($v, $job) use (&$got) {
-            $got[] = $job;
-            return 42;
-        }, 10, 2);
+        $nextId = 42;
+        add_filter(GenQueue::ENQUEUE_FILTER, function ($v, $type, $payload, $args) use (&$got, &$nextId) {
+            $got[] = [$type, $payload, $args];
+            return $nextId++;
+        }, 10, 4);
         $other = $this->post(800, [], [], 9);
         $this->save($other);
         self::assertFalse(wp_next_scheduled(Queue::EVENT, [$other]));
-        self::assertSame([
-            'type' => 'tldr_block.generate',
-            'payload' => ['post_id' => $other],
-            'idempotency_key' => 'post:' . $other,
-            'on_conflict' => 'replace',
-            'run_after' => self::NOW + 300,
-            'group' => 'tldr-block',
-        ], $got[0]);
-        $handlers = GenQueue::registerHandler([]);
-        $handlers['tldr_block.generate'](['post_id' => $other]);
+        self::assertCount(1, $got);
+        [$type, $payload, $args] = $got[0];
+        self::assertSame('tldr-block.generate', $type);
+        self::assertSame($other, $payload['post_id']);
+        self::assertStringStartsWith('post:' . $other . ':', $args['idempotency_key']);
+        self::assertSame(self::NOW + 300, $args['run_after']);
+        self::assertSame('tldr-block', $args['group']);
+        self::assertSame(42, PostState::job($other)['gq_id']);
+
+        // A second material save pushes the run time back with a new job;
+        // the first job, if it still runs, does nothing.
+        \IndianOpinion\TldrBlock\Clock::freeze(self::NOW + 100);
+        WpStub::updatePost($other, ['post_content' => self::html(self::text(800, 77))]);
+        $this->save($other);
+        self::assertCount(2, $got);
+        self::assertSame(self::NOW + 400, $got[1][2]['run_after']);
+        self::assertSame(43, PostState::job($other)['gq_id']);
+        $stale = (object) ['payload' => $got[0][1]];
+        self::assertSame('superseded', GenQueue::handle($stale)['outcome']);
+        self::assertSame(0, $this->caller->count());
+
+        $fresh = (object) ['payload' => $got[1][1]];
+        $this->caller->cost = 0.003;
+        $ctx = new class {
+            /** @var list<array{0: float|string, 1: array<string, mixed>}> */
+            public array $costs = [];
+
+            /** @param array<string, mixed> $usage */
+            public function addCost(float|string $amount, array $usage = []): void
+            {
+                $this->costs[] = [$amount, $usage];
+            }
+        };
+        self::assertSame('generated', GenQueue::handle($fresh, $ctx)['outcome']);
         self::assertSame('pending', PostState::status($other));
+        self::assertSame([[0.003, ['metered' => false]]], $ctx->costs, 'spend reaches the queue cap, unmetered without spend-meter');
+
+        // A WP_Error from gen-queue falls back to WP-Cron.
+        remove_all_filters(GenQueue::ENQUEUE_FILTER);
+        add_filter(GenQueue::ENQUEUE_FILTER, fn () => new \WP_Error('gen_queue', 'storage down'));
+        $third = $this->post(800, [], [], 10);
+        $this->save($third);
+        self::assertNotFalse(wp_next_scheduled(Queue::EVENT, [$third]));
     }
 
     /** T26 (case 26). */

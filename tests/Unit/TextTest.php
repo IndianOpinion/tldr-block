@@ -72,6 +72,30 @@ final class TextTest extends TestCase
         self::assertSame($long->sketch(), $round->sketch());
     }
 
+    /** Case 12: empty and tiny texts give usable fingerprints. */
+    public function testEmptyAndTinyFingerprints(): void
+    {
+        $empty = Fingerprint::of('');
+        self::assertSame([], $empty->sketch());
+        self::assertSame('', $empty->packedSketch());
+        self::assertSame(0.0, $empty->distance(Fingerprint::of('')));
+        self::assertFalse(Fingerprint::of('')->isMaterialChangeFrom($empty, 0.1));
+        $one = Fingerprint::of('Word');
+        self::assertCount(1, $one->sketch());
+        self::assertSame(1.0, $one->distance($empty));
+        self::assertTrue($one->isMaterialChangeFrom($empty, 0.9));
+        self::assertTrue(Fingerprint::of('Other')->isMaterialChangeFrom($one, 0.9));
+        self::assertFalse(Fingerprint::of('word')->isMaterialChangeFrom($one, 0.1), 'case does not matter');
+        $three = Fingerprint::of('one two three');
+        self::assertCount(1, $three->sketch());
+        $stored = Fingerprint::fromStored($empty->hash(), '');
+        self::assertSame(0.0, $stored->distance($empty));
+        $junk = Fingerprint::fromStored('abc', 'not base64!');
+        self::assertSame([], $junk->sketch());
+        // Punctuation only: no words, but a different exact hash.
+        self::assertSame([], Fingerprint::of('!!! ...')->sketch());
+    }
+
     public const FIXTURE_SKETCH_SHA = '9a366b1253b605f86488d9324b5682d1286d5874629c9878eb6e76055f939dcd';
 
     /** T13 (case 13). */

@@ -166,7 +166,7 @@ function delete_option(string $name): bool
     unset(S::$options[S::$blog][$name]);
     return true;
 }
-function wp_cache_delete(string $key, string $group = ''): bool
+function wp_cache_delete(int|string $key, string $group = ''): bool
 {
     return true;
 }
