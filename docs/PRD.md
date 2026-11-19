@@ -84,7 +84,8 @@ when the post changes. It carries no measured-result line.
   summarised in its own language.
 - N5. Structured data output (schema.org abstract and the like).
 - N6. Approving from WP-CLI or in bulk (see section 13).
-- N7. A provider SDK. All model calls go through `indianopinion/llm-json-php`.
+- N7. A provider SDK. All model calls go through `indianopinion/llm-json-php`,
+  or through a site's own `Caller` supplied by filter (case 30).
 - N8. Checking the summary for truth beyond the figure check in case 41.
   The editor is the check.
 
@@ -140,7 +141,8 @@ Terms used below:
       the nearest explicit `on` or `off`. If any category resolves to
       `off`, the result is `off`. Otherwise if any resolves to `on`, the
       result is `on`.
-   3. The global default (default `on`).
+   3. The global default (default `off`, ruling 10 in section 13: the
+      operator opts in per category or globally).
    The result passes through a filter (5.4). Post types without the
    `category` taxonomy go straight from step 1 to step 3.
 5. The switch governs both generation and display. Turning a category off
@@ -176,12 +178,22 @@ Terms used below:
     lower-casing) and a sketch: the 128 smallest distinct 32-bit hashes of
     the word 3-shingles (words as in case 2, lower-cased). Texts with fewer
     than three words use single words as shingles.
+    The 32-bit hash of a shingle is its CRC32 (builder decision, recorded
+    in ARCHITECTURE.md): native, fast and well spread, which is all a
+    bottom-k estimate needs. An empty text has an empty sketch; two empty
+    sketches are at distance 0, an empty and a non-empty one at 1.
 13. Material change: the exact hash differs and the estimated Jaccard
-    distance between the current sketch and the sketch of the source the
-    live summary (or the newest candidate, if there is no live summary) was
-    generated from is at or above the change threshold (default 0.10,
-    range 0.01 to 0.90). Comparison is always against the generated-from
-    sketch, never the previous save, so many small edits add up.
+    distance between the current sketch and the comparison sketch is at or
+    above the change threshold (default 0.10, range 0.01 to 0.90, also
+    filterable with `tldr_block_change_threshold`). The comparison sketch
+    for queueing is the newest generated-from fingerprint: the source of
+    the queued or last generated job, else the pending candidate's, else
+    the live summary's (builder decision). Rejections, failures and
+    hand-written summaries also set it, so a rejection does not trigger an
+    automatic regeneration of the same text. Staleness (case 19) is judged
+    separately, against the live summary's own generated-from sketch.
+    Comparison is never against the previous save, so many small edits add
+    up.
 14. The plugin's own block and shortcode are never part of the source text.
     Inserting the block, or the theme printing the summary, must not change
     the fingerprint. Without this rule, approving a summary changes the post
@@ -207,7 +219,9 @@ Terms used below:
 19. On a material change to a post with a live summary, the live summary is
     marked stale at once (before any generation), action `stale` fires, and
     the page caches are told (case 58). With the default stale display
-    setting `hide`, readers stop seeing it at that moment.
+    setting `hide`, readers stop seeing it at that moment. Approving a
+    candidate whose source the post has since moved away from materially
+    makes a live summary that is stale from the start.
 20. If the stale display setting is `keep`, the stale live summary stays
     visible until a new candidate is approved, rejected with "keep
     previous", or the editor withdraws it.
@@ -223,13 +237,28 @@ Terms used below:
     still respects the kill switch, the daily caps and the per-post limit,
     and the word minimum unless `force` is given by a user who holds the
     settings capability.
-25. Queue backend: when `gen-queue` is active (the filter
-    `gen_queue_enqueue_job` returns an integer), the plugin enqueues job
-    type `tldr_block.generate` with payload `{post_id}`, idempotency key
-    `post:<id>`, replace-on-conflict, `run_after` set from the debounce,
-    and group `tldr-block`. Otherwise it schedules a single WP-Cron event
+25. Queue backend: when `gen-queue` is active, the plugin uses its
+    published soft interface. It registers job type `tldr-block.generate`
+    on the action `gen_queue_register_types` with
+    `gen_queue_register_type()` (group `tldr-block`, one attempt, its
+    `meter` set to purpose `tldr-block.summary`), and enqueues through
+    `apply_filters('gen_queue_enqueue_job', null, $type, $payload, $args)`
+    with payload `{post_id, token}`, idempotency key
+    `post:<id>:<token>`, `run_after` set from the debounce, and group
+    `tldr-block`. The filter returns a job id; `null` means gen-queue is
+    absent and a `WP_Error` means the enqueue failed, and in both cases
+    the plugin falls back to WP-Cron. gen-queue's idempotency returns an
+    existing queued job unchanged, so a reschedule cannot move its run
+    time: each schedule therefore gets a fresh token, the earlier job is
+    cancelled with `gen_queue_cancel()`, and an earlier job that still
+    runs finds a token that no longer matches and does nothing. Without
+    gen-queue the plugin schedules a single WP-Cron event
     `tldr_block_generate` with argument `[post_id]`, removing any earlier
-    event for the same post first.
+    event for the same post first. gen-queue's own cap and switch apply on
+    top of the plugin's: with no gen-queue cap set, its jobs wait. The
+    handler reports the provider's cost to gen-queue with
+    `$ctx->addCost()`, marked `metered` when spend-meter already recorded
+    the call, so the queue's cap sees the spend once.
 26. The handler for either backend is the same function. It re-reads the
     post and re-checks eligibility at run time. A post no longer eligible
     is skipped with a logged reason and no spend.
@@ -245,9 +274,12 @@ Terms used below:
     `deferred` with the reason and stops without calling.
 29. The prompt is built from the template (case 44) with: title, source
     text, target language, format, point counts and word limits.
-30. The call goes through an `llm-json-php` client: the one returned by the
-    filter `tldr_block_client`, or one the plugin builds from settings
-    (provider, key, model chain). Purpose name `tldr-block.summary`.
+30. The call goes through the plugin's own `Caller` interface (builder
+    decision): the filter `tldr_block_client` may return a `Caller` (so a
+    site can run without `llm-json-php`, group C ruling of 14 November) or
+    an `llm-json-php` `Client`, which the plugin adapts; otherwise the
+    plugin builds a client from settings (provider, key, model chain).
+    When no caller can be had, the job fails before anything is reserved. Purpose name `tldr-block.summary`.
     Temperature 0.2, output token cap 800, total deadline 90 seconds.
 31. The JSON schema in bullet mode is an object with one required key
     `points`, an array of strings. In paragraph mode it is an object with
@@ -287,16 +319,30 @@ Terms used below:
 36. Per-post limit: at most 3 generations per post per local day (setting,
     range 1 to 20), counting manual and automatic ones. Further triggers
     for that post are deferred to the next day.
+    Every attempt counts, retries included (builder decision): with the
+    default limit of 3, a post whose first three attempts fail is deferred
+    to the next day rather than making a fourth call the same day.
 37. Deferred jobs are retried after the local day rolls over (scheduled at
     00:05 site time plus a random jitter up to 30 minutes). Deferred jobs
     run in order of oldest change first.
-38. When `spend-meter` is active (`SPEND_METER_API` equals 1), the job calls
-    its pre-spend filter with purpose `tldr-block.summary`, caller
-    `tldr-block`, provider and model. A decision with `allowed` not exactly
-    true defers the job with the meter's reason code. On a reservation the
-    job sends exactly one record (with tokens, status and reservation id)
-    or one release. An unknown contract version means the meter is treated
-    as absent. The plugin's own caps still apply.
+38. When `spend-meter` is active (`SPEND_METER_API` equals 1), the job
+    applies its filter `spend_meter_pre_spend` with `null` and an intent
+    array: `purpose` `tldr-block.summary`, `caller` `tldr-block`,
+    `provider` (a lower-case slug), `model`, `est_input_tokens` (prompt
+    characters divided by four) and `max_output_tokens` (800). A `null`
+    answer means no meter is present. A decision with `allowed` not
+    exactly true defers the job with the meter's reason code, and any
+    reservation it carries is given back with `spend_meter_release`. After
+    an allowed check the job sends exactly one `spend_meter_record` (the
+    call happened) or one `spend_meter_release` (it did not), with
+    `reservation_id`, `status` (`ok`, `error_billed` or `error_unbilled`),
+    `input_tokens`, `output_tokens`, `provider_cost` in integer nanos when
+    the provider reported a cost, `latency_ms`, `error_code` on failure
+    and `http_status` 402 on a credit error. An answer that fails
+    validation (case 32) was still billed and is recorded as
+    `error_billed` with `error_code` `validation`. An unknown contract version or
+    an unusable answer means the meter is treated as absent. The plugin's
+    own caps still apply.
 39. Failure handling: a failed call (chain exhausted, validation failure,
     timeout) retries with backoff at 5 minutes, 30 minutes and 2 hours,
     then sets status `failed` with the error class and a short message. A
@@ -323,14 +369,24 @@ Terms used below:
     filter). The prompt asks for the summary in the language of the article
     and names the expected language.
 44. Prompt template: a built-in generic template, filterable as a whole
-    (system and user parts). When `prompt-library` is active the plugin
-    registers a default under slug `tldr-block/summary` and renders it
-    with variables `title`, `body`, `language`, `format`, `points_min`,
-    `points_max`, `max_words`. If rendering fails it falls back to the
-    built-in template and logs the reason. The built-in prompt asks for:
-    a neutral summary of the main points, facts only from the article, no
-    opinion, no new figures, no references to "this article", the language
-    named, the JSON shape in case 31.
+    (system and user parts). Placeholders use the `{{ name }}` syntax of
+    `prompt-library`, so the same text is its default. When
+    `prompt-library` is active the plugin ships the built-in template on
+    `init` with `promptlib_register_default('tldr-block', $definition)`
+    under slug `tldr-block-summary` (that plugin's slugs allow no `/`),
+    declares its variables with `promptlib_register_consumer()`, and
+    renders through `apply_filters('promptlib_render', null,
+    'tldr-block-summary', $values, 'live', ['consumer' => 'tldr-block',
+    'fallback' => $definition])`, with variables `title`, `body`,
+    `language`, `format`, `format_instruction`, `points_min`,
+    `points_max`, `max_words`. A `null` answer means the plugin is absent.
+    If rendering fails (a `WP_Error` or an unusable shape) it falls back to
+    the built-in template and logs the reason. The built-in prompt asks
+    for: a neutral summary of the main points, facts only from the
+    article, no opinion, no new figures, no references to "this article",
+    the language named, the JSON shape in case 31. Delimiter look-alikes
+    (any case or spacing) are removed from the article and the title, and
+    the title is kept to one line.
 
 ### 4.5 Review
 
@@ -535,7 +591,7 @@ All receive the post id first.
 | `tldr_block_prompt` | `['system' => ..., 'user' => ...]`, `array $vars` | case 44 |
 | `tldr_block_schema` | schema array, `string $format` | case 31 |
 | `tldr_block_validate` | `string[]` errors, `array $output`, `array $context` | add checks |
-| `tldr_block_client` | null, `array $settings` | supply an `llm-json-php` `Client` |
+| `tldr_block_client` | null, `array $settings` | supply a `Caller` or an `llm-json-php` `Client` (case 30) |
 | `tldr_block_daily_cap` | setting | constant `TLDR_BLOCK_DAILY_CAP` wins over both |
 | `tldr_block_approve_capability` | `edit_others_posts` | review rights |
 | `tldr_block_settings_capability` | `manage_options` | settings and `force` |
@@ -544,6 +600,7 @@ All receive the post id first.
 | `tldr_block_html` | HTML, `Summary $summary`, `array $args` | final markup |
 | `tldr_block_load_styles` | true | case 63 |
 | `tldr_block_debounce_seconds` | setting | case 18 |
+| `tldr_block_change_threshold` | setting | case 13 |
 
 ### 5.5 REST routes
 
@@ -560,6 +617,7 @@ write routes marked A also check the approve capability.
 | `POST /posts/<id>/withdraw` (A) | | 200 state |
 | `POST /posts/<id>/restore` (A) | `history_id` | 200 state |
 | `PUT /posts/<id>/manual` (A) | `points` or `text` | 200 state, 422 on validation |
+| `POST /posts/<id>/override` (A) | `mode` (`auto`, `on`, `off`) | 200 state; fires `display_changed` with `post_switch` (builder addition: the per-post switch of G7) |
 
 Meta keys are registered as protected and are not writable through the core
 posts endpoint. The only public read is the field in case 64.
@@ -615,7 +673,7 @@ in the database; logging goes to the PHP error log and the action.
 |---|---|---|
 | Generation (kill switch) | off until a key and model are set, then on | on, off; constant wins |
 | Display | on | on, off |
-| Global default mode | on | on, off |
+| Global default mode | off (ruling 10) | on, off |
 | Post types | `post` | any public type that supports the editor |
 | Trigger statuses | `publish`, `future`, `pending` | any of these plus `draft` |
 | Minimum words | 600 | 100 to 10000 |
@@ -684,8 +742,10 @@ the stored values are merged.
   and loads it with its bootstrap file, so no Composer is needed at
   runtime. If another plugin already loaded the library, the bundled copy
   is not loaded.
-- Optional: `gen-queue`, `spend-meter`, `prompt-library`, detected at
-  `plugins_loaded` through their constants and filters.
+- Optional: `gen-queue` (filter `gen_queue_enqueue_job` hooked),
+  `spend-meter` (`SPEND_METER_API` equals 1) and `prompt-library` (filter
+  `promptlib_render` hooked), each used through its published 0.1.0
+  interface (cases 25, 38 and 44).
 - Page caches and CDNs: the plugin fires `tldr_block_display_changed` and
   calls `clean_post_cache()`; it does not purge any cache itself. The
   README shows how to hook a purge.
@@ -886,6 +946,29 @@ The builder answers each in `docs/ARCHITECTURE.md`.
 10. Global default mode on a fresh install: `on` (this PRD, safe because
     nothing shows without approval) or `off` so the operator opts in by
     category?
+
+### Answers (rulings applied in 0.1.0)
+
+Recorded in full, with reasons, in `docs/ARCHITECTURE.md`.
+
+1. `off` in any category wins.
+2. Stale summaries are hidden (`hide` stays the default).
+3. 0.10 stays the default and is filterable
+   (`tldr_block_change_threshold`).
+4. A title change alone is never material.
+5. No bulk approve.
+6. `edit_others_posts` approves; authors cannot approve their own posts.
+7. Backfill stays WP-CLI only.
+8. No build step: editor scripts use the `wp` globals, with a hand-written
+   asset file for the block's script dependencies.
+9. No measured-result line in the README.
+10. The global default mode on a fresh install is `off`.
+
+Builder additions, accepted at review: the `Caller` interface and the
+client filter (case 30), comparison against the newest generated-from
+fingerprint (case 13), CRC32 shingle hashes (case 12), retries counting
+towards the per-post limit (case 36), and the per-post override route
+(section 5.5).
 
 ## 14. Lessons from production
 

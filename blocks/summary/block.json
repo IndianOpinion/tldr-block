@@ -1,0 +1,24 @@
+{
+    "$schema": "https://schemas.wp.org/trunk/block.json",
+    "apiVersion": 3,
+    "name": "tldr-block/summary",
+    "title": "Summary",
+    "category": "text",
+    "icon": "editor-ul",
+    "description": "The approved summary of this post. Shows nothing until an editor approves one.",
+    "keywords": ["tldr", "summary", "key points"],
+    "textdomain": "tldr-block",
+    "attributes": {
+        "heading": { "type": "string", "default": "" },
+        "showHeading": { "type": "boolean", "default": true }
+    },
+    "supports": {
+        "html": false,
+        "multiple": false,
+        "align": ["wide", "full"],
+        "spacing": { "margin": true, "padding": true },
+        "color": { "background": true, "text": true }
+    },
+    "usesContext": ["postId", "postType"],
+    "editorScript": "file:./editor.js"
+}
