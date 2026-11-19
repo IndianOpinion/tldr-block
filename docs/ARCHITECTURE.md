@@ -95,7 +95,11 @@ The front end reads only post meta that the main query has already primed, plus 
 - **Per-post limit and retries.** Every attempt counts towards the per-post limit, including retries. With the default limit of 3, a post whose first three attempts fail is deferred to the next day rather than making a fourth call the same day. This follows lesson 9: one post cannot eat the budget.
 - **Deferred jobs.** One sweep event per day at 00:05 site time plus up to 30 minutes of jitter. It re-queues every deferred post, oldest change first, a few seconds apart.
 - **Cron tick budget.** At most 3 jobs or 60 seconds per WP-Cron request; the rest move one minute later.
-- **Lock.** `add_option()` on a lock row is an atomic insert; a lock older than 30 seconds is taken over. The object cache is bypassed for the counters.
+- **Lock.** One `INSERT IGNORE` of a lock row on the options table's unique key, so exactly one process wins; a lock older than 30 seconds is taken over by one conditional `UPDATE`. `add_option()` is not used for this: it checks and then upserts, so two processes could both think they hold the lock. The object cache is bypassed for the counters.
+- **Lease under the lock.** The per-post lease is checked and taken inside the counter lock, with the post's meta cache dropped first, so two runners cannot both start the same post. The caller is built before anything is reserved, so a missing provider spends nothing.
+- **Approving an outdated candidate.** If the post changed materially after the candidate was generated, the approved summary is stored as stale from the start.
+- **Redaction.** Log lines, the last-errors list and the job's `last_error` pass through a redactor that removes the configured API key, bearer tokens and key-shaped strings.
+- **Delimiters.** Look-alikes of the article markers (any case or spacing) are removed from the article and the title; the title is kept to one line.
 - **Status field.** One status per post, holding the latest event. Withdrawn and stale are also flags on the live summary, so a queued regeneration does not lose them.
 - **Markdown and HTML in output are stripped, not rejected** (case 32 rule 4). URLs and instruction-like lines ("ignore the previous instructions", "as an AI") are rejected. Hand-edited text skips the instruction check: the editor wrote it.
 - **Script check** uses a fixed table from language code to Unicode script, with a 50 percent share. Japanese is not checked (three scripts). It can be turned off in settings.
@@ -110,15 +114,19 @@ The front end reads only post meta that the main query has already primed, plus 
 
 ## Integrations
 
-The gen-queue, spend-meter and prompt-library plugins were not released when 0.1.0 was built. Their hook names come from their requirement documents as cited in the PRD and are isolated in `src/Integrations/`:
+The bridges in `src/Integrations/` follow the published 0.1.0 interfaces of gen-queue, spend-meter and prompt-library (their READMEs and PRDs), checked at review:
 
 | Plugin | Detection | Hooks used |
 |---|---|---|
-| gen-queue | a callback on `gen_queue_enqueue_job` that returns an integer | filter `gen_queue_enqueue_job` (job array with type `tldr_block.generate`, payload `{post_id}`, idempotency key `post:<id>`, replace on conflict, `run_after`, group `tldr-block`), filter `gen_queue_cancel_job`, handler registered on `gen_queue_handlers` |
-| spend-meter | `SPEND_METER_API === 1` | filter `spend_meter_pre_spend`, actions `spend_meter_record` and `spend_meter_release` |
-| prompt-library | a callback on `prompt_library_render` | filter `prompt_library_defaults` (slug `tldr-block/summary`), filter `prompt_library_render` |
+| gen-queue | a callback on `gen_queue_enqueue_job` | type `tldr-block.generate` registered on `gen_queue_register_types` with `gen_queue_register_type()` (group `tldr-block`, one attempt, `meter` purpose `tldr-block.summary`); soft enqueue `apply_filters('gen_queue_enqueue_job', null, $type, ['post_id', 'token'], ['idempotency_key' => 'post:<id>:<token>', 'run_after', 'group', 'max_attempts' => 1])`; `gen_queue_cancel()` for the earlier job |
+| spend-meter | `SPEND_METER_API === 1` | filter `spend_meter_pre_spend` with `null` and an intent array (`purpose`, `caller`, `provider`, `model`, `est_input_tokens`, `max_output_tokens`); actions `spend_meter_record` (`status` `ok`, `error_billed` or `error_unbilled`, tokens, `provider_cost` in nanos) and `spend_meter_release` |
+| prompt-library | a callback on `promptlib_render` | `promptlib_register_default('tldr-block', $definition)` and `promptlib_register_consumer()` on `init`; `apply_filters('promptlib_render', null, 'tldr-block-summary', $values, 'live', ['consumer' => 'tldr-block', 'fallback' => $definition])` |
 
-Any error or unusable answer from them means "absent". The plugin's own caps and kill switch always apply.
+- **gen-queue debounce.** gen-queue returns an existing queued job unchanged for a repeated idempotency key, so a reschedule could not push the run time back. Each schedule gets a fresh token in its key and payload; the earlier job is cancelled, and if it runs anyway its token no longer matches the one in the post's job record and it does nothing. A `WP_Error` from the enqueue falls back to WP-Cron.
+- **prompt-library slug.** Its slugs allow letters, digits, `-` and `_` only, so the PRD's `tldr-block/summary` became `tldr-block-summary`. The built-in template uses its `{{ name }}` placeholders, so one text serves both paths.
+- **gen-queue spend.** The handler passes the provider's reported cost to `$ctx->addCost()`, with `metered` true when spend-meter is present (it already has the row), so gen-queue's own cap counts tldr-block's spend.
+- **spend-meter status.** The record is sent after validation: a billed answer that fails the checks is `error_billed` with `error_code` `validation`, not `ok`.
+- **`null` means absent** for both the meter and the prompt library. Any other error or unusable answer is also treated as absent and logged; the plugin's own caps and kill switch always apply.
 
 ## Security notes
 

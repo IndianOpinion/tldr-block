@@ -179,7 +179,7 @@ The title and text of eligible posts are sent to the model provider you configur
 - The figure check compares numbers only, not units or meaning. The editor is the check.
 - The cost cap works only when the provider reports cost.
 - Shortcode-like bracketed words such as `[sic]` are dropped from the source text along with real shortcode tags.
-- The `gen-queue`, `spend-meter` and `prompt-library` hook names follow their requirement documents and are isolated in `src/Integrations/`; they will be aligned with those plugins' releases.
+- With `gen-queue` active, its own daily cap and switch apply as well: until a gen-queue cap is set, its jobs wait.
 - No bulk approve, by design.
 
 ## FAQ
